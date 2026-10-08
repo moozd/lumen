@@ -72,11 +72,13 @@ fn navigate_stacked_commit(
         return false;
     }
     state.save_stacked_viewed_files();
+    state.save_stacked_annotations();
     state.current_commit_index = new_index;
     if let Some(commit) = state.stacked_commits.get(new_index) {
         let file_diffs = load_single_commit_diffs(&commit.commit_id, &options.file, backend);
         state.reload(file_diffs, None);
         state.load_stacked_viewed_files();
+        state.load_stacked_annotations();
         true
     } else {
         false
@@ -1867,8 +1869,8 @@ fn run_app_internal(
                             state.needs_reload = true;
                         }
                         KeyCode::Char('s') => {
-                            if !state.annotations.is_empty() {
-                                let n = state.annotations.len();
+                            let n = state.annotation_count();
+                            if n > 0 {
                                 let noun = if n == 1 { "annotation" } else { "annotations" };
                                 let msg = format!(
                                     "Exit lumen and write {} {} to stdout?\n\n\

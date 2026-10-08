@@ -181,6 +181,9 @@ pub struct AppState {
     pub current_commit_index: usize,
     /// Tracks viewed files per commit SHA (commit SHA -> set of viewed filenames)
     stacked_viewed_files: HashMap<String, HashSet<String>>,
+    /// Annotations of the commits not currently shown (commit SHA -> annotations).
+    /// The current commit's annotations live in `annotations`.
+    stacked_annotations: HashMap<String, Vec<Annotation>>,
     /// VCS backend name ("git" or "jj")
     pub vcs_name: &'static str,
     /// The commit reference used to open the diff (e.g., "HEAD~2..HEAD", "main..feature")
@@ -312,6 +315,7 @@ impl AppState {
             stacked_commits: Vec::new(),
             current_commit_index: 0,
             stacked_viewed_files: HashMap::new(),
+            stacked_annotations: HashMap::new(),
             vcs_name: "git", // Default, will be set by caller
             diff_reference: None,
             diff_panel_focus: DiffPanelFocus::default(),
@@ -775,6 +779,61 @@ impl AppState {
         }
     }
 
+    /// Stash the current commit's annotations before switching commits
+    /// (stacked mode only), so `reload` can't drop them and they don't
+    /// show up on another commit's diff.
+    pub fn save_stacked_annotations(&mut self) {
+        if !self.stacked_mode {
+            return;
+        }
+        if let Some(commit) = self.stacked_commits.get(self.current_commit_index) {
+            let annotations = std::mem::take(&mut self.annotations);
+            self.stacked_annotations
+                .insert(commit.commit_id.clone(), annotations);
+        }
+    }
+
+    /// Restore the current commit's annotations (stacked mode only)
+    pub fn load_stacked_annotations(&mut self) {
+        if !self.stacked_mode {
+            return;
+        }
+        if let Some(commit) = self.stacked_commits.get(self.current_commit_index) {
+            self.annotations = self
+                .stacked_annotations
+                .remove(&commit.commit_id)
+                .unwrap_or_default();
+        }
+    }
+
+    /// Annotations grouped by commit, in stack order, skipping commits
+    /// without any (stacked mode only).
+    fn stacked_annotation_groups(&self) -> Vec<(&StackedCommitInfo, &[Annotation])> {
+        self.stacked_commits
+            .iter()
+            .enumerate()
+            .filter_map(|(i, commit)| {
+                let annotations = if i == self.current_commit_index {
+                    self.annotations.as_slice()
+                } else {
+                    self.stacked_annotations.get(&commit.commit_id)?.as_slice()
+                };
+                (!annotations.is_empty()).then_some((commit, annotations))
+            })
+            .collect()
+    }
+
+    /// Number of annotations across all commits
+    pub fn annotation_count(&self) -> usize {
+        if !self.stacked_mode {
+            return self.annotations.len();
+        }
+        self.stacked_annotation_groups()
+            .iter()
+            .map(|(_, annotations)| annotations.len())
+            .sum()
+    }
+
     /// Reload file diffs, optionally unmarking changed files from viewed set.
     /// Preserves scroll position and current file when possible.
     pub fn reload(&mut self, file_diffs: Vec<FileDiff>, changed_files: Option<&HashSet<String>>) {
@@ -904,11 +963,14 @@ impl AppState {
         self.annotations.retain(|a| a.id != id);
     }
 
-    /// Format all annotations for export (GitHub PR review comment style).
+    /// Format all annotations for export.
     ///
-    /// Uses `path`, `line`/`start_line`, and `side` references instead of
-    /// embedding full source code — matching the shape of the GitHub Pull
-    /// Request review comment API.
+    /// Uses `path` and line references instead of embedding full source
+    /// code. Each line reference says which side of the diff it counts
+    /// lines in: `new version` (the file after the change) or `old version`
+    /// (the file before it). In stacked mode annotations are grouped under the
+    /// commit they were made on, since line numbers only make sense
+    /// against that commit.
     pub fn format_annotations_for_export(&self) -> String {
         let mut result = String::new();
 
@@ -916,42 +978,61 @@ impl AppState {
             result.push_str(&format!("# {}\n\n", reference));
         }
 
-        for (i, ann) in self.annotations.iter().enumerate() {
-            if i > 0 {
-                result.push_str("---\n\n");
-            }
+        if !self.stacked_mode {
+            result.push_str(&format_annotation_list(&self.annotations));
+            return result.trim_end().to_string();
+        }
 
-            match &ann.target {
-                AnnotationTarget::File => {
-                    result.push_str(&format!("**{}**\n\n", ann.filename));
-                }
-                AnnotationTarget::LineRange { panel, start_line, end_line, .. } => {
-                    let side = match panel {
-                        DiffPanelFocus::Old => "LEFT",
-                        _ => "RIGHT",
-                    };
-                    if start_line == end_line {
-                        result.push_str(&format!(
-                            "**{}** line {} ({})\n\n",
-                            ann.filename, start_line, side,
-                        ));
-                    } else {
-                        result.push_str(&format!(
-                            "**{}** lines {}-{} ({})\n\n",
-                            ann.filename, start_line, end_line, side,
-                        ));
-                    }
-                }
-            }
-
-            // Comment body
-            result.push_str(&ann.content);
-            result.push_str("\n\n");
+        for (commit, annotations) in self.stacked_annotation_groups() {
+            result.push_str(&format!("## {} {}\n\n", commit.short_id, commit.summary));
+            result.push_str(&format_annotation_list(annotations));
         }
 
         result.trim_end().to_string()
     }
 }
+
+/// Format annotations as `**path** lines A-B (new version)` headers followed
+/// by the comment body, separated by `---`.
+fn format_annotation_list(annotations: &[Annotation]) -> String {
+    let mut result = String::new();
+
+    for (i, ann) in annotations.iter().enumerate() {
+        if i > 0 {
+            result.push_str("---\n\n");
+        }
+
+        match &ann.target {
+            AnnotationTarget::File => {
+                result.push_str(&format!("**{}**\n\n", ann.filename));
+            }
+            AnnotationTarget::LineRange { panel, start_line, end_line, .. } => {
+                let side = match panel {
+                    DiffPanelFocus::Old => "old version",
+                    _ => "new version",
+                };
+                if start_line == end_line {
+                    result.push_str(&format!(
+                        "**{}** line {} ({})\n\n",
+                        ann.filename, start_line, side,
+                    ));
+                } else {
+                    result.push_str(&format!(
+                        "**{}** lines {}-{} ({})\n\n",
+                        ann.filename, start_line, end_line, side,
+                    ));
+                }
+            }
+        }
+
+        // Comment body
+        result.push_str(&ann.content);
+        result.push_str("\n\n");
+    }
+
+    result
+}
+
 pub fn adjust_scroll_to_line(
     line: usize,
     scroll: u16,
@@ -1077,5 +1158,88 @@ mod tests {
 
         assert_eq!(state.current_file, 0);
         assert!(state.file_diffs.is_empty());
+    }
+
+    fn make_commit(commit_id: &str, summary: &str) -> StackedCommitInfo {
+        StackedCommitInfo {
+            commit_id: commit_id.to_string(),
+            short_id: commit_id[..7].to_string(),
+            change_id: None,
+            summary: summary.to_string(),
+        }
+    }
+
+    fn line_range(panel: DiffPanelFocus, start_line: usize, end_line: usize) -> AnnotationTarget {
+        AnnotationTarget::LineRange { panel, start_line, end_line }
+    }
+
+    fn annotate(state: &mut AppState, filename: &str, target: AnnotationTarget, content: &str) {
+        state.add_annotation(filename.to_string(), target, content.to_string(), SystemTime::now());
+    }
+
+    /// Mirrors `navigate_stacked_commit` without a VCS backend.
+    fn switch_commit(state: &mut AppState, index: usize, file_diffs: Vec<FileDiff>) {
+        state.save_stacked_viewed_files();
+        state.save_stacked_annotations();
+        state.current_commit_index = index;
+        state.reload(file_diffs, None);
+        state.load_stacked_viewed_files();
+        state.load_stacked_annotations();
+    }
+
+    #[test]
+    fn test_export_labels_sides_as_new_and_old_version() {
+        let mut state = AppState::new(vec![make_file_diff("a.rs")], None);
+        state.diff_reference = Some("main..HEAD".to_string());
+        annotate(&mut state, "a.rs", line_range(DiffPanelFocus::New, 14, 18), "why this name?");
+        annotate(&mut state, "a.rs", line_range(DiffPanelFocus::Old, 3, 3), "keep this");
+        annotate(&mut state, "a.rs", AnnotationTarget::File, "split this file");
+
+        let expected = "# main..HEAD\n\n\
+            **a.rs** lines 14-18 (new version)\n\nwhy this name?\n\n---\n\n\
+            **a.rs** line 3 (old version)\n\nkeep this\n\n---\n\n\
+            **a.rs**\n\nsplit this file";
+        assert_eq!(state.format_annotations_for_export(), expected);
+    }
+
+    #[test]
+    fn test_stacked_annotations_survive_commit_switch() {
+        let mut state = AppState::new(vec![make_file_diff("a.rs")], None);
+        state.init_stacked_mode(vec![
+            make_commit("1111111aaaa", "first"),
+            make_commit("2222222bbbb", "second"),
+        ]);
+        annotate(&mut state, "a.rs", line_range(DiffPanelFocus::New, 1, 2), "on first");
+
+        // The second commit doesn't touch a.rs, so reload alone would drop it
+        switch_commit(&mut state, 1, vec![make_file_diff("b.rs")]);
+        assert!(state.annotations.is_empty());
+        assert_eq!(state.annotation_count(), 1);
+
+        switch_commit(&mut state, 0, vec![make_file_diff("a.rs")]);
+        assert_eq!(state.annotations.len(), 1);
+        assert_eq!(state.annotations[0].content, "on first");
+    }
+
+    #[test]
+    fn test_stacked_export_groups_annotations_by_commit() {
+        let mut state = AppState::new(vec![make_file_diff("a.rs")], None);
+        state.diff_reference = Some("main..HEAD".to_string());
+        state.init_stacked_mode(vec![
+            make_commit("1111111aaaa", "first"),
+            make_commit("2222222bbbb", "second"),
+            make_commit("3333333cccc", "third"),
+        ]);
+        annotate(&mut state, "a.rs", line_range(DiffPanelFocus::New, 1, 1), "on first");
+        switch_commit(&mut state, 1, vec![make_file_diff("b.rs")]);
+        switch_commit(&mut state, 2, vec![make_file_diff("a.rs")]);
+        annotate(&mut state, "a.rs", line_range(DiffPanelFocus::New, 5, 6), "on third");
+
+        // Commits are listed in stack order, and the one without annotations is skipped
+        let expected = "# main..HEAD\n\n\
+            ## 1111111 first\n\n**a.rs** line 1 (new version)\n\non first\n\n\
+            ## 3333333 third\n\n**a.rs** lines 5-6 (new version)\n\non third";
+        assert_eq!(state.format_annotations_for_export(), expected);
+        assert_eq!(state.annotation_count(), 2);
     }
 }
